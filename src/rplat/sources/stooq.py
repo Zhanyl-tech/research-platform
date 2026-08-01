@@ -1,0 +1,164 @@
+"""A real, free, no-credentials price source — proof the interface swaps.
+
+Stooq serves daily bars as CSV over plain HTTP with no API key, which makes it
+the honest choice for demonstrating that :class:`~rplat.sources.base.DataSource`
+is a real seam and not a single-implementation abstraction.
+
+It is also a good illustration of the interface's *point*, because it cannot
+supply most of what the platform wants. There is no restatement history, no
+delisting metadata, and no filing dates. So this source implements bars and a
+minimal security record, returns nothing for the rest, and — importantly —
+stamps ``knowledge_date`` equal to the session date, which is a claim about the
+data that is only approximately true.
+
+That approximation is documented rather than hidden: see :meth:`StooqSource.caveats`.
+Never used by ``make demo``, which must run offline and deterministically.
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections.abc import Iterable
+from datetime import date, datetime
+
+from rplat.sources.base import DataSource
+from rplat.types import BarRecord, Dataset, SecurityRecord
+
+STOOQ_URL = "https://stooq.com/q/d/l/?s={symbol}&i=d"
+DEFAULT_TIMEOUT = 20.0
+
+
+class StooqFetchError(RuntimeError):
+    """Raised when Stooq cannot be reached or returns something unusable."""
+
+
+class StooqSource(DataSource):
+    """Daily bars from Stooq for a fixed list of symbols.
+
+    Args:
+        symbols: Stooq symbols, e.g. ``["aapl.us", "msft.us"]``.
+        listing_date: Date to record as the securities' listing date. Stooq does
+            not publish one; the earliest bar is used when omitted.
+        timeout: Per-request timeout in seconds.
+    """
+
+    name = "stooq"
+
+    def __init__(
+        self,
+        symbols: list[str],
+        *,
+        listing_date: date | None = None,
+        timeout: float = DEFAULT_TIMEOUT,
+    ) -> None:
+        self.symbols = symbols
+        self.listing_date = listing_date
+        self.timeout = timeout
+        self._cache: dict[str, list[BarRecord]] = {}
+
+    def describe(self) -> str:
+        return f"Stooq daily bars for {len(self.symbols)} symbol(s), no credentials required"
+
+    @staticmethod
+    def caveats() -> list[str]:
+        """What this source cannot honestly promise.
+
+        Worth reading before using it for anything but a smoke test — each of
+        these is a place where the point-in-time guarantee degrades to an
+        assumption.
+        """
+        return [
+            "knowledge_date is assumed equal to the session date. Stooq does not "
+            "publish when a bar was made available, so a late-corrected bar is "
+            "indistinguishable from one that was right the first time.",
+            "Prices are already split-adjusted by the vendor, using every split "
+            "up to today. That is precisely the look-ahead this platform avoids "
+            "with raw prices plus as-of factors, and it cannot be undone without "
+            "a corporate-actions feed.",
+            "No delisted symbols, so a universe built from Stooq alone is "
+            "survivorship-biased by construction.",
+            "No fundamentals and therefore no restatement history.",
+        ]
+
+    def records(self, dataset: Dataset) -> Iterable[object]:
+        match dataset:
+            case Dataset.BARS:
+                return [bar for symbol in self.symbols for bar in self._bars(symbol)]
+            case Dataset.SECURITIES:
+                return self._securities()
+            case _:
+                return ()
+
+    def _securities(self) -> list[SecurityRecord]:
+        out: list[SecurityRecord] = []
+        for symbol in self.symbols:
+            bars = self._bars(symbol)
+            if not bars:
+                continue
+            first = self.listing_date or min(bar.effective_date for bar in bars)
+            out.append(
+                SecurityRecord(
+                    security_id=_security_id(symbol),
+                    name=symbol.upper(),
+                    listing_date=first,
+                    knowledge_date=first,
+                )
+            )
+        return out
+
+    def _bars(self, symbol: str) -> list[BarRecord]:
+        if symbol in self._cache:
+            return self._cache[symbol]
+
+        url = STOOQ_URL.format(symbol=symbol)
+        # Refuse anything but https before opening. urllib will happily open
+        # file:// and ftp://, so a symbol containing a crafted URL would
+        # otherwise turn a data fetch into a local file read.
+        if urllib.parse.urlparse(url).scheme != "https":
+            raise StooqFetchError(f"refusing non-https URL for {symbol}: {url!r}")
+
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "rplat/0.1"})  # noqa: S310
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:  # noqa: S310
+                payload = response.read().decode("utf-8", errors="replace")
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise StooqFetchError(f"could not fetch {symbol} from Stooq: {exc}") from exc
+
+        if not payload.lstrip().lower().startswith("date"):
+            raise StooqFetchError(
+                f"unexpected response for {symbol} (rate limited or unknown symbol): "
+                f"{payload[:80]!r}"
+            )
+
+        security_id = _security_id(symbol)
+        bars: list[BarRecord] = []
+        for row in csv.DictReader(io.StringIO(payload)):
+            try:
+                session = datetime.strptime(row["Date"], "%Y-%m-%d").date()
+                bars.append(
+                    BarRecord(
+                        security_id=security_id,
+                        effective_date=session,
+                        open=float(row["Open"]),
+                        high=float(row["High"]),
+                        low=float(row["Low"]),
+                        close=float(row["Close"]),
+                        volume=int(float(row.get("Volume") or 0)),
+                        # See caveats(): an assumption, not a published fact.
+                        knowledge_date=session,
+                    )
+                )
+            except (KeyError, ValueError):
+                continue
+
+        self._cache[symbol] = bars
+        return bars
+
+
+def _security_id(symbol: str) -> str:
+    """Stable synthetic id for a Stooq symbol."""
+    return f"STOOQ:{symbol.upper()}"
