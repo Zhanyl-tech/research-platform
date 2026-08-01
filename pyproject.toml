@@ -52,7 +52,10 @@ ignore = [
 "tests/*" = ["S101"]
 
 [tool.mypy]
-python_version = "3.11"
+# Deliberately no `python_version` pin. The CI matrix runs each interpreter it
+# claims to support, and mypy should type-check against the one it is running
+# under. Pinning 3.11 here made mypy parse numpy's 3.12-only `type` statements
+# under 3.11 syntax rules and fail on the 3.12 runner.
 strict = true
 warn_unreachable = true
 files = ["src", "tests"]
