@@ -1,13 +1,19 @@
 """Command line interface.
 
 ``rplat demo`` is the important one: it builds the store from the fixture and
-then walks the four point-in-time traps, showing the same query returning
+then walks the five point-in-time traps, showing the same query returning
 different — and correct — answers on different as-of dates.
+
+The query commands (``universe``, ``bars``, ``history``) open the store
+read-only and refuse a path that does not exist. They used to create an empty
+database there and report "0 securities", which looks exactly like an empty
+universe.
 """
 
 from __future__ import annotations
 
 import sys
+import uuid
 from datetime import date, datetime
 from pathlib import Path
 
@@ -27,11 +33,12 @@ from rplat.sources.fixture import (
     RESTATED_PERIOD_END,
     RESTATED_SECURITY,
     RESTATEMENT_FILING,
+    SPLIT_ANNOUNCED,
     SPLIT_EX_DATE,
     SPLIT_SECURITY,
     FixtureSource,
 )
-from rplat.store.store import Store
+from rplat.store.store import Store, StoreError, StoreSchemaError
 from rplat.types import Dataset
 from rplat.universe import get_universe, resolve_ticker
 
@@ -57,6 +64,56 @@ def _show(frame: pd.DataFrame, *, limit: int = 20) -> None:
         click.echo(f"    … {len(frame) - limit} more rows")
 
 
+def _open_for_query(db: Path) -> Store:
+    """Open an existing store read-only, or fail with the command that builds it."""
+    if not db.exists():
+        raise click.UsageError(f"{db} not found — run: rplat ingest --db {db}")
+    try:
+        return Store.open(db, read_only=True)
+    except StoreSchemaError as exc:
+        raise click.ClickException(f"{db}: {exc}") from exc
+
+
+def _wal(path: Path) -> Path:
+    """DuckDB's write-ahead log for a database file."""
+    return path.with_name(path.name + ".wal")
+
+
+def _remove_quietly(*paths: Path) -> None:
+    for path in paths:
+        path.unlink(missing_ok=True)
+
+
+def _refuse_pending_wal(db: Path) -> None:
+    """Refuse to put a new store where DuckDB would replay an old log into it.
+
+    DuckDB keeps writes it has not checkpointed in ``<db>.wal`` and replays that
+    file into ``<db>`` the next time ``<db>`` is opened. A store renamed into
+    place inherits whatever log already sits beside it. A stale log from a
+    crashed writer would then mix that writer's rows into the freshly built
+    store, silently and permanently after one writable open. Opening a
+    *missing* path discards an orphan log, which is why building in place
+    never had this problem and renaming does.
+    """
+    wal = _wal(db)
+    if not wal.exists():
+        return
+    if db.exists():
+        raise click.ClickException(
+            f"refusing to replace {db}: {wal.name} exists, so either another process is "
+            "writing to the store or a writer did not close it cleanly. If nothing has it "
+            "open, open it writable once so DuckDB replays and checkpoints the log "
+            "(`python -c \"import duckdb; duckdb.connect('<path>').close()\"`), "
+            "or move both files aside. Nothing was changed."
+        )
+    raise click.ClickException(
+        f"refusing to build {db}: {wal.name} exists without {db.name}. It is a "
+        "write-ahead log left by a writer that did not close cleanly, and DuckDB would "
+        "replay it into the new store. Move it aside or delete it, then retry. "
+        "Nothing was changed."
+    )
+
+
 def _rule(title: str) -> None:
     click.echo()
     click.secho(f"── {title} ", fg="cyan", bold=True, nl=False)
@@ -71,19 +128,57 @@ def main() -> None:
 
 @main.command()
 @click.option("--db", type=click.Path(path_type=Path), default=DEFAULT_DB, show_default=True)
-@click.option("--force", is_flag=True, help="Rebuild even if the store already exists.")
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Replace an existing store with a fresh build of the synthetic fixture.",
+)
 def ingest(db: Path, force: bool) -> None:
-    """Load the deterministic fixture dataset into a store."""
+    """Build a store from the deterministic synthetic fixture, and nothing else.
+
+    With --force, whatever the store held is replaced by fixture data. That
+    makes --force a way to rebuild a fixture store, not an upgrade path for a
+    store holding other data (a StooqSource ingest, your own appends).
+
+    The new store is built in a temporary file beside the target and renamed
+    into place only after the ingest has succeeded, so a failure at any point
+    leaves an existing store exactly as it was. --force refuses to replace a
+    file that is not an rplat store or that another process has open. Either
+    way, ingest refuses while a write-ahead log (<db>.wal) sits beside the
+    target, because DuckDB would replay it into the new store.
+    """
     if db.exists() and not force:
         click.echo(f"{db} already exists; pass --force to rebuild")
         return
+    _refuse_pending_wal(db)
     if db.exists():
-        db.unlink()
+        try:
+            is_store = Store.is_store_file(db)
+        except StoreError as exc:
+            # Busy or unreadable: the answer is unknown, and saying "not an
+            # rplat store" would send the user after the wrong cause.
+            raise click.ClickException(
+                f"refusing to replace {db}: {exc}. Nothing was changed."
+            ) from exc
+        if not is_store:
+            raise click.ClickException(
+                f"refusing to replace {db}: it is not an rplat store. Nothing was changed."
+            )
 
     source = FixtureSource()
     click.echo(f"source: {source.describe()}")
-    with Store.open(db) as store:
-        written = store.ingest(source)
+    # Same directory as the target, so the final rename is atomic on POSIX.
+    staging = db.with_name(f".{db.name}.building-{uuid.uuid4().hex[:8]}")
+    try:
+        with Store.open(staging) as store:
+            written = store.ingest(source)
+        # Again at the last moment: a log that appeared during the build would
+        # be replayed into the renamed file just the same.
+        _refuse_pending_wal(db)
+        staging.replace(db)
+    except BaseException:
+        _remove_quietly(staging, _wal(staging))
+        raise
     for dataset, count in written.items():
         click.echo(f"  {dataset.value:<20} {count:>7,} rows")
     click.echo(f"wrote {db}")
@@ -96,7 +191,7 @@ def ingest(db: Path, force: bool) -> None:
 def universe(db: Path, as_of: datetime, include_delisted: bool) -> None:
     """Show the universe knowable on a date."""
     when = as_of.date()
-    with Store.open(db) as store:
+    with _open_for_query(db) as store:
         frame = get_universe(store, when, include_delisted=include_delisted)
     click.echo(f"universe as of {when}: {len(frame)} securities")
     _show(frame, limit=50)
@@ -119,7 +214,7 @@ def bars(
 ) -> None:
     """Show bars knowable on a date."""
     when = as_of.date()
-    with Store.open(db) as store:
+    with _open_for_query(db) as store:
         frame = get_bars(
             store,
             when,
@@ -140,16 +235,15 @@ def bars(
 def history(db: Path, security_id: str, period_end: datetime, metric: str) -> None:
     """Show every value ever reported for one fundamental fact."""
     period = period_end.date()
-    with Store.open(db) as store:
+    with _open_for_query(db) as store:
         frame = restatement_history(store, security_id, period, metric)
     click.echo(f"revisions of {security_id} {metric} for period ending {period}:")
     _show(frame.reindex(columns=["knowledge_date", "value", "source", "ingested_at"]))
 
 
 @main.command()
-@click.option("--db", type=click.Path(path_type=Path), default=DEFAULT_DB, show_default=True)
-def demo(db: Path) -> None:
-    """Build the store and walk every point-in-time trap it defends against."""
+def demo() -> None:
+    """Build an in-memory store and walk every point-in-time trap it defends against."""
     source = FixtureSource()
     click.secho("\nBuilding the store from the deterministic fixture", bold=True)
     click.echo(f"  {source.describe()}")
@@ -158,12 +252,10 @@ def demo(db: Path) -> None:
     written = store.ingest(source)
     total = sum(written.values())
     click.echo(f"  {total:,} rows across {len(written)} datasets, no network, no credentials")
-    if db:
-        pass  # the --db option is accepted for symmetry; the demo stays in memory
 
     # ── 1. survivorship ────────────────────────────────────────────────────
     _rule("1. Survivorship bias")
-    click.echo("  Northwind Freight goes bankrupt on 2023-03-10, announced 2023-02-24.")
+    click.echo("  Northwind Freight delists on 2023-03-10 (bankruptcy announced 2023-02-24).")
     click.echo("  A universe built from today's security master would never show it.\n")
     for as_of in (date(2022, 6, 30), date(2023, 6, 30)):
         frame = get_universe(store, as_of)
@@ -205,16 +297,24 @@ def demo(db: Path) -> None:
         "  today has that split baked into prices from years earlier.\n"
     )
     session = date(2022, 8, 1)
-    for as_of in (date(2022, 8, 20), date(2023, 1, 3)):
+    notes = {
+        date(2022, 8, 20): "not yet announced",
+        date(2022, 9, 16): f"announced {SPLIT_ANNOUNCED}, not yet effective",
+        date(2023, 1, 3): "after the ex-date",
+    }
+    for as_of, note in notes.items():
         frame = get_bars(store, as_of, security_ids=[SPLIT_SECURITY], start=session, end=session)
         if frame.empty:
             continue
         bar = frame.iloc[0]
         click.echo(
             f"  as of {as_of}: close on {session} = {bar['close']:.2f} "
-            f"(factor {bar['adjustment_factor']:.1f})"
+            f"(factor {bar['adjustment_factor']:.1f}; {note})"
         )
-    click.echo("\n  Same session, two legitimate answers. Only the as-of date resolves it.")
+    click.echo(
+        "\n  Same session, two legitimate answers. Only the as-of date resolves it.\n"
+        "  Knowing a split is coming is not a reason to halve prices before it happens."
+    )
 
     # ── 5. late arrival ────────────────────────────────────────────────────
     _rule("5. Late-arriving data")

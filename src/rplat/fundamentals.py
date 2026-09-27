@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import date
 
 import pandas as pd
 
+from rplat.clock import require_date
 from rplat.store.store import Store
 from rplat.types import Dataset
 
@@ -14,10 +16,12 @@ def get_fundamentals(
     store: Store,
     as_of_date: date,
     *,
-    security_ids: list[str] | None = None,
-    metrics: list[str] | None = None,
+    security_ids: Sequence[str] | None = None,
+    metrics: Sequence[str] | None = None,
+    start: date | None = None,
+    end: date | None = None,
 ) -> pd.DataFrame:
-    """Return fundamentals as they were understood on ``as_of_date``.
+    """Return fundamentals as they were understood at the end of ``as_of_date``.
 
     Two lags matter and they are different.
 
@@ -34,12 +38,30 @@ def get_fundamentals(
 
     Both are handled by the same as-of resolution: filter to filings already
     made, then keep the most recent filing per fact.
+
+    Args:
+        store: Bitemporal store.
+        as_of_date: A :class:`datetime.date`; see :mod:`rplat.clock`.
+        security_ids: Restrict to these securities.
+        metrics: Restrict to these metrics.
+        start: Earliest ``period_end`` to return (inclusive).
+        end: Latest ``period_end`` to return (inclusive).
+
+    ``security_id``, ``metric`` and ``period_end`` are all fact-key columns, so
+    each filter is pushed into SQL ahead of the as-of window without changing
+    which revision of a surviving fact wins.
     """
-    frame = store.as_of(Dataset.FUNDAMENTALS, as_of_date, security_ids=security_ids)
+    require_date(as_of_date)
+    key_in = {"metric": metrics} if metrics is not None else None
+    frame = store.as_of(
+        Dataset.FUNDAMENTALS,
+        as_of_date,
+        security_ids=security_ids,
+        key_in=key_in,
+        key_between={"period_end": (start, end)},
+    )
     if frame.empty:
         return frame
-    if metrics is not None:
-        frame = frame[frame["metric"].isin(metrics)]
     return frame.sort_values(["security_id", "period_end", "metric"]).reset_index(drop=True)
 
 
@@ -48,7 +70,7 @@ def latest_known(
     as_of_date: date,
     metric: str,
     *,
-    security_ids: list[str] | None = None,
+    security_ids: Sequence[str] | None = None,
 ) -> pd.DataFrame:
     """The most recent *reported period* for one metric, per security.
 
@@ -69,7 +91,8 @@ def restatement_history(
     """Every value ever reported for one fact, in filing order.
 
     The audit trail that answers "why is this number this number" — which is the
-    question the lineage layer in Phase 2 generalises to computed features.
+    question the planned lineage layer (Phase 2) would generalise to computed
+    features.
     """
     return store.revisions(
         Dataset.FUNDAMENTALS,

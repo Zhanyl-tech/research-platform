@@ -36,9 +36,18 @@ def get_universe(store: Store, as_of_date: date, *, include_delisted: bool = Fal
     Ticker is resolved as of the same date, so ``ZZZ`` maps to whichever company
     held it then — not whichever holds it now.
 
+    Boundaries: ``listing_date`` is inclusive and ``delisting_date`` is
+    exclusive (the first date the name no longer trades). So a name is in the
+    universe on its last trading session, and every bar *for session D* that
+    is knowable as of D belongs to a name in D's universe. The fixture tape and
+    a test enforce that. It does not extend to older bars: as of 2023-06-30,
+    Northwind's 2021-2023 history is knowable, but Northwind is no longer in
+    the universe.
+
     Args:
         store: The bitemporal store to read.
-        as_of_date: The date to reconstruct.
+        as_of_date: The date to reconstruct, a :class:`datetime.date` (see
+            :mod:`rplat.clock`).
         include_delisted: When True, also return names already delisted by
             ``as_of_date``. Useful for building a survivorship *test*, and for
             attributing returns to names that have since died.
@@ -55,7 +64,8 @@ def get_universe(store: Store, as_of_date: date, *, include_delisted: bool = Fal
         alive = listed
     else:
         # NaT compares False, which is what we want: a security with no known
-        # delisting date is still alive.
+        # delisting date is still alive. Strict ">" because delisting_date is
+        # the first non-trading date (exclusive end; see SecurityRecord).
         not_yet_dead = securities["delisting_date"].isna() | (
             securities["delisting_date"] > pd.Timestamp(as_of_date)
         )

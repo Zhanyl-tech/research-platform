@@ -24,7 +24,9 @@ class DataSource(ABC):
     injects look-ahead into every downstream backtest. That is the single
     assumption the rest of the platform cannot verify for you, which is why
     :mod:`rplat.sources.fixture` ships restatements and late arrivals — so the
-    detectors in Phase 3 have something real to catch.
+    detectors planned for Phase 3 will have something real to catch. They are
+    not built yet; the append-time check in :mod:`rplat.store.validate` is the
+    only leakage detection today.
     """
 
     #: Short identifier recorded on every row this source writes.

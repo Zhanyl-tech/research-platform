@@ -64,7 +64,7 @@ both forever and a query picks between them:
 SELECT * FROM (
     SELECT *, ROW_NUMBER() OVER (
         PARTITION BY security_id, period_end, metric
-        ORDER BY knowledge_date DESC, ingested_at DESC
+        ORDER BY knowledge_date DESC, ingest_seq DESC, row_ordinal DESC
     ) AS rn
     FROM fundamentals
     WHERE knowledge_date <= $as_of
@@ -83,6 +83,88 @@ to eliminate.
 
 You need both. The window reconstructs a single coherent view; the filter makes
 it the view from a particular day.
+
+**Ties are broken by order, never by clock.** Two beliefs about one fact with
+the same `knowledge_date` resolve to the later append (`ingest_seq`, drawn from
+a DuckDB sequence) and, within one append, the later record (`row_ordinal`).
+The first version ordered by `ingested_at`. Every row in a batch shared that
+timestamp, and across batches it trusted two wall-clock readings to increase.
+The 2026-09 audit appended 3,000 copies of one value followed by a correction
+in a single batch, and the correction lost 200 runs out of 200. Re-running that
+probe against the old code while fixing it gave the same 200 out of 200.
+
+**Filters go before the window only on fact-key columns.** `get_bars(start=,
+end=)` pushes `effective_date` into the `WHERE`, and `security_ids` and
+`metrics` go the same way. That is safe because each of those columns is part
+of the partition key, so the filter removes whole partitions and cannot change
+which revision wins in one that survives. A filter on `value`, say, could drop
+the newest revision and resurrect a superseded one, so `Store.as_of` refuses
+it. Every value is bound as a parameter. An id used to be interpolated into
+the SQL, and `SEC0001') OR (security_id = 'SEC0001` returned the restated 1.2
+as of 2022-09-01.
+
+## As-of semantics
+
+A `knowledge_date` is a calendar date with no time of day. That is deliberate:
+most sources publish a date, and inventing a time for it would be false
+precision. But the date must mean exactly one thing, or the same query leaks on
+one call and not the next. Before this was pinned down, a `datetime` at 09:30
+was silently accepted and returned a bar that only closes at 16:00. A zoned
+`datetime` was compared through DuckDB's session `TimeZone`, which defaults to
+the machine's zone
+([DuckDB docs](https://duckdb.org/docs/current/sql/data_types/timestamp.html)),
+so the answer depended on the laptop. The contract, implemented in
+[`rplat/clock.py`](../src/rplat/clock.py) and pinned by `tests/test_clock.py`:
+
+1. **Reference zone.** Knowledge and as-of dates are calendar dates in
+   **America/New_York**. US sessions and SEC filing dates are both assigned
+   in Eastern time. A source for another market converts its stamps to this
+   zone's calendar date.
+2. **`as_of = D` is the view at the end of day D.** Inclusive: every fact with
+   `knowledge_date <= D` is visible. Exclusive of the next day: nothing stamped
+   `D + 1` or later.
+3. **Dates only.** Every as-of argument, and every `start`/`end`, must be a
+   `datetime.date`. A `datetime`, and so a `pandas.Timestamp`, raises
+   `TypeError` at every public entry point. The store also pins DuckDB's
+   session `TimeZone` to UTC, which is why `ingested_at` (a `TIMESTAMPTZ`)
+   reads the same on every machine.
+4. **Ranges over the date a fact is about are inclusive at both ends**:
+   `get_bars(start=, end=)` over sessions, `get_fundamentals(start=, end=)`
+   over period ends.
+5. **Lifecycle ends are exclusive.** `delisting_date` and a ticker's `end_date`
+   are the first date the name no longer trades or the symbol no longer
+   applies. `listing_date` and `start_date` are inclusive. A delisted name's
+   last bar is the session before its `delisting_date`, and on that session it
+   is still in the universe. That session's return is the delisting return a
+   survivorship-aware backtest must capture.
+
+**A fact stamped D may land at any instant during D.** A bar is known at the
+16:00 close. An SEC filing started by 5:30 p.m. ET is deemed filed that
+business day, and Forms 3, 4, 5, Form 144 and Schedules 13D/13G get the same
+treatment up to 10 p.m. ET
+([17 CFR 232.13(a)](https://www.law.cornell.edu/cfr/text/17/232.13)). So
+`as_of = D` is leak-free only for a decision made after everything stamped D
+has arrived. For a decision at a real instant, convert it:
+
+```python
+as_of_for_decision(datetime(2022, 8, 1, 9, 30, tzinfo=ZoneInfo("America/New_York")))
+# -> 2022-07-31
+```
+
+The input must be timezone-aware; a naive `datetime` raises. By default the
+result is the calendar day before the decision's New York date, because
+today's stamps are never safe. The step is a calendar day, not a trading
+session: a Monday-open decision gets Sunday, which includes Friday's bars. If
+you can defend a time by which every source you read has finished publishing
+for the day, pass it as `day_complete_at`. For example, `time(16, 0)` suits a
+bars-only pipeline that trusts close-of-session bars; anything reading SEC
+filings should not go earlier than 22:00. That value is your assertion, not
+something the store can check.
+
+What this does not do: store a time of day. Capturing EDGAR acceptance
+timestamps or session close instants in a `knowledge_ts TIMESTAMPTZ` column
+would let a 09:30 decision see an 08:00 filing from the same day. That is
+future work; it needs sources that actually publish those instants.
 
 ## The four ways this bites
 
@@ -112,12 +194,22 @@ only firms that made it.
   `knowledge_date`. As of any date before the announcement, the resolved row has
   no delisting date at all, so `get_universe` **cannot** filter the name out.
   Survivorship is not avoided by remembering to include dead names; it is
-  structurally impossible to introduce.
+  structurally impossible to introduce, *provided* every table that carries an
+  end date follows the same rule. The fixture's `ticker_map` once did not. It
+  put each ticker's end date on the row knowable from the listing date, so as
+  of 2021-10-01 it already "knew" Northwind's 2023 bankruptcy. Ticker ends are
+  now second rows too, and `tests/test_fixture.py` checks every dataset on a
+  grid of dates for an end date visible before its announcement.
 
 There is a subtlety worth naming: between the announcement and the delisting the
 company still trades. Dropping it on the announcement date would be its own,
 opposite look-ahead. The universe keeps it until it actually stops trading —
-`tests/test_universe.py` pins each of those boundaries.
+`tests/test_universe.py` pins each of those boundaries. The price tape agrees
+with the universe: the last bar is the session before `delisting_date`, and a
+test asserts that every bar for session D that is knowable as of D belongs to a
+name in D's universe. That is a statement about each day's own session only.
+A delisted name's older bars stay knowable after it leaves the universe, which
+is what lets a backtest still price its history.
 
 ### 3. Corporate actions
 
@@ -130,13 +222,26 @@ Vendor "adjusted close" columns are adjusted with every split up to *today*.
   checks it.
 - **Here:** the store holds **raw** prices only, plus a corporate-actions table
   with the announcement in `knowledge_date`. `get_bars(..., adjust=True)` builds
-  the factor from actions knowable on the as-of date and returns the factor it
-  used, so the adjustment is auditable rather than baked in.
+  the factor from splits that are both announced *and* effective on the as-of
+  date, and returns the factor it used, so the adjustment is auditable rather
+  than baked in.
 
-Note that adjustment becomes valid at the **announcement**, not the ex-date. A
-researcher on the day after a split is announced legitimately knows it is
-coming. Waiting for the ex-date would understate what was knowable — an error in
-the other direction, and a real one.
+Knowing about a split and applying it are different things. From the
+announcement, the split is knowable, and `get_corporate_actions` returns it,
+ex-date and ratio included. It is applied to prices only from the ex-date,
+because before then there is no discontinuity to remove. An earlier version
+applied it from the announcement and documented that as intended. Returns were
+unaffected, but every price *level* was wrong for the weeks in between. As of
+2022-09-16, three days before Beacon's 2-for-1, the latest close was reported at
+395.50 when 791.00 traded, which corrupts market cap, P/E and any price filter.
+The invariant is now tested on a grid of dates: the latest visible bar has
+`adjustment_factor == 1`, *provided the ex-date session's own bar is visible*.
+That holds throughout the fixture but not in general. If the ex-date bar
+arrives late, the split still applies from the ex-date, so until that bar lands
+the latest visible bar is a pre-split session shown in post-split terms (a
+100.00 close reported as 50.00, factor 2.0), which is not a price that traded.
+`tests/test_prices.py` pins that case. Anything that reads a current price
+level from the latest bar should check its `adjustment_factor`.
 
 ### 4. Late arrival and identity
 
@@ -158,10 +263,22 @@ validity windows.
 The store guarantees that a query returns the belief held on a date. It cannot
 guarantee that `knowledge_date` was *set honestly* in the first place.
 
-A source that stamps `knowledge_date` with the effective date — because the real
-publication timestamp was not captured — produces a store that is internally
-consistent and quietly wrong. Nothing downstream can detect this, because from
-the inside it looks identical to data that genuinely was available immediately.
+Two kinds of bad stamp need separating, because the store can catch one and
+not the other.
+
+**Impossible stamps are caught.** A bar whose `knowledge_date` is before its
+session, or a quarter "filed" before it ended, cannot be true. `Store.append`
+rejects the whole batch with a `RecordValidationError` that lists the offending
+rows, and writes nothing. The same check refuses OHLC bars with `high < low` or
+non-positive prices, splits without a finite positive ratio, and end dates that
+do not follow their start dates. It is cheap, and it is the first real piece of
+leakage detection here.
+
+**Plausible-but-wrong stamps are not.** A source that stamps `knowledge_date`
+with the effective date, because the real publication timestamp was not
+captured, produces a store that is internally consistent and quietly wrong.
+Nothing downstream can detect this, because from the inside it looks identical
+to data that genuinely was available immediately.
 
 This is why `StooqSource.caveats()` exists and says so out loud: Stooq publishes
 no availability timestamps, so its `knowledge_date` is an assumption, not a
@@ -169,10 +286,11 @@ fact. And it is why the reference dataset is synthetic — real free data has no
 restatement history, so you cannot demonstrate correct restatement handling with
 it.
 
-Phase 3's leakage detector attacks this from the other side: rather than
-trusting the ingest, it checks whether any *feature* value at time T depends on
-inputs whose `knowledge_date` is after T, with a deliberately leaky fixture to
-prove the detector fires.
+Phase 3's planned leakage detector will attack this from the other side.
+Rather than trusting the ingest, it will check whether any *feature* value at
+time T depends on inputs whose `knowledge_date` is after T, and it will ship
+with a deliberately leaky fixture to prove it fires. Neither exists yet. Today
+the append-time check above is the only leakage detection in the code.
 
 ## What this costs
 
@@ -185,7 +303,10 @@ Being honest about the trade, since the design is not free:
   by design. It is friction, and it is the point.
 - **The window function is more expensive than a plain scan.** Partitioning by
   fact key over an append-only table is the operation the whole store is tuned
-  for, which is a large part of why the engine underneath is columnar.
+  for, which is a large part of why the engine underneath is columnar. Asking
+  for one session pushes the range into SQL ahead of the window and stays cheap.
+  Asking for the full view of millions of facts does not. The README's
+  "Measured" section has the numbers, the command and the machine.
 - **Sources must supply real availability dates.** Many do not. That is a
   sourcing problem this design surfaces rather than solves — which is better
   than a design that hides it.

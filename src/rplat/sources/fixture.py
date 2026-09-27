@@ -6,17 +6,23 @@ prevent are invisible in it — you cannot demonstrate that you handle a
 restatement correctly using data that has never been restated.
 
 So the reference dataset is synthetic and deliberately hostile. It is generated
-from a fixed seed, so ``make demo`` is byte-identical on every machine and needs
-no network or credentials, and it contains, by construction:
+from fixed seeds, so it needs no network or credentials. Every process
+produces the same records, whatever ``PYTHONHASHSEED`` is. A test checks that
+with SHA-256 digests across subprocesses. Identical records across *NumPy
+versions* are not guaranteed: NEP 19 lets ``Generator`` distribution methods
+change their streams in feature releases
+(https://numpy.org/neps/nep-0019-rng-policy.html). The traps themselves are
+constants and never depend on the RNG. The dataset contains, by construction:
 
 ============================  ==================================================
 Trap                          How it appears here
 ============================  ==================================================
 Survivorship bias             Two names delist mid-history. Each has *two*
-                              ``securities`` rows: the original with no
-                              delisting date, and a later one announcing it.
-                              Query before the announcement and the name is
-                              still in the universe, as it must be.
+                              ``securities`` rows and *two* ``ticker_map`` rows:
+                              the originals with no end date, and later ones
+                              announcing it. Query before the announcement and
+                              the name is still in the universe, and its ticker
+                              has no end date, as it must be.
 Ticker recycling              ``ZZZ`` belongs to Vela Mining until it is
                               acquired, then to Zenith Robotics from 2023. Any
                               pipeline keyed on ticker silently splices two
@@ -142,8 +148,8 @@ def sessions(start: date, end: date) -> Iterator[date]:
     """Weekday sessions in ``[start, end]``.
 
     Holidays are ignored on purpose. A real calendar belongs to an exchange
-    calendar library, and Phase 3's calendar-misalignment check is where that
-    gap gets flagged rather than papered over.
+    calendar library. Phase 3 plans a calendar-misalignment check that will
+    flag that gap rather than paper over it; it does not exist yet.
     """
     day = start
     while day <= end:
@@ -216,16 +222,35 @@ class FixtureSource(DataSource):
         return out
 
     def _tickers(self) -> list[TickerRecord]:
-        return [
-            TickerRecord(
-                security_id=spec.security_id,
-                ticker=spec.ticker,
-                start_date=spec.listing_date,
-                knowledge_date=spec.listing_date,
-                end_date=spec.delisting_date,
+        """Two rows for a symbol that stops: before the news, and after.
+
+        The end date is news, exactly like the delisting in ``_securities``.
+        An earlier version put ``end_date`` on the row knowable from the
+        listing date, so as of 2021 the ticker map already "knew" Northwind's
+        2023 bankruptcy date.
+        """
+        out: list[TickerRecord] = []
+        for spec in SPECS:
+            out.append(
+                TickerRecord(
+                    security_id=spec.security_id,
+                    ticker=spec.ticker,
+                    start_date=spec.listing_date,
+                    knowledge_date=spec.listing_date,
+                )
             )
-            for spec in SPECS
-        ]
+            if spec.delisting_date and spec.delisting_announced:
+                # Same fact key (security_id, ticker, start_date), later belief.
+                out.append(
+                    TickerRecord(
+                        security_id=spec.security_id,
+                        ticker=spec.ticker,
+                        start_date=spec.listing_date,
+                        knowledge_date=spec.delisting_announced,
+                        end_date=spec.delisting_date,
+                    )
+                )
+        return out
 
     def _bars(self) -> list[BarRecord]:
         """Geometric brownian motion, seeded per security so it is stable."""
@@ -265,6 +290,13 @@ class FixtureSource(DataSource):
 
             rows = zip(days, opens, highs, lows, closes, volumes, strict=True)
             for day, o, h, low_, c, v in rows:
+                # delisting_date is the first non-trading date (exclusive), so
+                # the tape stops the session before it. The arrays above still
+                # span through delisting_date so the RNG stream, and every other
+                # bar's values, stay exactly as they were before this rule was
+                # fixed.
+                if spec.delisting_date is not None and day >= spec.delisting_date:
+                    continue
                 knowledge = day
                 if spec.security_id == LATE_SECURITY and LATE_FIRST <= day <= LATE_LAST:
                     knowledge = LATE_ARRIVED
@@ -293,10 +325,13 @@ class FixtureSource(DataSource):
             )
         ]
         # Quarterly dividends for the steady payers, announced a month ahead.
-        for spec in SPECS:
+        for index, spec in enumerate(SPECS):
             if spec.security_id not in {"SEC0004", "SEC0007", "SEC0008"}:
                 continue
-            rng = np.random.default_rng(self.seed + hash(spec.security_id) % 1000)
+            # Seeded from the spec's position, like bars (+0) and fundamentals
+            # (+500). This used hash(security_id), and str hashing is salted
+            # per process, so dividend amounts changed on every run.
+            rng = np.random.default_rng(self.seed + 1000 + index)
             for year in (2021, 2022, 2023):
                 for month in (3, 6, 9, 12):
                     ex_date = date(year, month, 15)
